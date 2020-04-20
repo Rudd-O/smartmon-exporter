@@ -3,8 +3,9 @@ Description=Export S.M.A.R.T. disk attributes for Prometheus
 
 [Service]
 Environment=PORT=9102
+Environment=CACHE_TIMEOUT=300
 EnvironmentFile=-@SYSCONFDIR@/default/@NAME@
-ExecStart=@SBINDIR@/@NAME@ $PORT
+ExecStart=@SBINDIR@/@NAME@ $PORT $CACHE_TIMEOUT
 
 [Install]
 WantedBy=multi-user.target
