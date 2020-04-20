@@ -1,0 +1,10 @@
+[Unit]
+Description=Export S.M.A.R.T. disk attributes for Prometheus
+
+[Service]
+Environment=PORT=9102
+EnvironmentFile=-@SYSCONFDIR@/default/@NAME@
+ExecStart=@SBINDIR@/@NAME@ $PORT
+
+[Install]
+WantedBy=multi-user.target
