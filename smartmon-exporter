@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 
 import collections
 import http.server
@@ -299,7 +299,9 @@ class SimplePromHandler(http.server.BaseHTTPRequestHandler):
                 def output(o):
                     with outputs_lock:
                         outputs.append(o)
-                for device, type_ in get_device_list():
+                device_list = get_device_list()
+                output("smartmon_total_device_count %s\n" % len(device_list))
+                for device, type_ in device_list:
                     device_path, device = device, os.path.basename(device)
                     idle = is_standby(device_path)
                     output("smartmon_disk_standby{device=\"%s\",type=\"%s\"} %s\n" % (device, type_, int(idle)))
