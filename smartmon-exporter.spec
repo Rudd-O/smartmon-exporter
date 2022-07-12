@@ -3,7 +3,7 @@
 
 Summary:        Export S.M.A.R.T. disk attributes for Prometheus
 Name:           smartmon-exporter
-Version:        0.0.6
+Version:        0.0.7
 Release:        %{mybuildnumber}%{?dist}
 License:        GPL
 Group:          System administration tools
@@ -21,6 +21,7 @@ BuildRequires:  systemd-rpm-macros
 %endif
 
 Requires:       smartmontools
+Requires:       hdparm
 Requires:       bash
 
 %description
