@@ -234,6 +234,7 @@ def is_standby(device):
             # The drive does not support checking power status.
             # We pretend it's active as a response.
             return False
+        raise
     logging.debug(out)
     idle = "drive state is:  standby" in out
     if idle:
