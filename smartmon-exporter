@@ -15,7 +15,7 @@ import time
 import threading
 
 
-smartmon_prog = r'''#!/bin/bash
+smartmon_prog = r"""#!/bin/bash
 # Script informed by the collectd monitoring script for smartmontools (using smartctl)
 # by Samuel B. <samuel_._behan_(at)_dob_._sk> (c) 2012
 # source at: http://devel.dob.sk/collectd-scripts/
@@ -212,7 +212,7 @@ disk="$0"
 type="$1"
 
 do_drive ${disk} ${type}
-'''
+"""
 
 
 logging.basicConfig(level=logging.INFO)
@@ -224,7 +224,16 @@ cache_lock = threading.Lock()
 
 
 def is_standby(device):
-    out = subprocess.check_output(['/usr/sbin/hdparm', '-C', device], universal_newlines=True)
+    try:
+        out = subprocess.check_output(
+            ["/usr/sbin/hdparm", "-C", device],
+            universal_newlines=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        if exc.returncode == 25:
+            # The drive does not support checking power status.
+            # We pretend it's active as a response.
+            return False
     logging.debug(out)
     idle = "drive state is:  standby" in out
     if idle:
@@ -236,6 +245,8 @@ def is_standby(device):
 
 old_devlist = None
 old_device_list = None
+
+
 def get_device_list():
     global old_devlist, old_device_list
 
@@ -249,11 +260,15 @@ def get_device_list():
     logging.debug("Asking smartctl to scan devices.")
     device_list = [
         x.strip().split("|")
-        for x in
-        subprocess.check_output([
-            'bash', '-c',
-            ''' /usr/sbin/smartctl --scan-open -n standby | awk '/^\/dev/{print $1 "|" $3}' '''
-        ]).decode("utf-8").splitlines()
+        for x in subprocess.check_output(
+            [
+                "bash",
+                "-c",
+                """ /usr/sbin/smartctl --scan-open -n standby | awk '/^\/dev/{print $1 "|" $3}' """,
+            ]
+        )
+        .decode("utf-8")
+        .splitlines()
         if x.strip()
     ]
     old_devlist = devlist
@@ -263,16 +278,17 @@ def get_device_list():
 
 
 class SimplePromHandler(http.server.BaseHTTPRequestHandler):
-
     def handle_non_metrics(self):
         if self.path == "/":
             self.send_response(200)
-            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
             self.wfile.write(
-                ("<html><body>%s exporter.  "
-                "<a href='/metrics'>Metrics.</a>"
-                "<body></html>" % os.path.basename(__file__)).encode("utf-8")
+                (
+                    "<html><body>%s exporter.  "
+                    "<a href='/metrics'>Metrics.</a>"
+                    "<body></html>" % os.path.basename(__file__)
+                ).encode("utf-8")
             )
             return True
         elif self.path != "/metrics":
@@ -280,7 +296,7 @@ class SimplePromHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             return True
 
-    def log_request(code='-', size='-'):
+    def log_request(code="-", size="-"):
         pass
 
     def do_GET(self):
@@ -296,39 +312,72 @@ class SimplePromHandler(http.server.BaseHTTPRequestHandler):
                 threads = []
                 outputs_lock = threading.Lock()
                 outputs = []
+
                 def output(o):
                     with outputs_lock:
                         outputs.append(o)
+
                 device_list = get_device_list()
                 output("smartmon_total_device_count %s\n" % len(device_list))
                 for device, type_ in device_list:
                     device_path, device = device, os.path.basename(device)
                     idle = is_standby(device_path)
-                    output("smartmon_disk_standby{device=\"%s\",type=\"%s\"} %s\n" % (device, type_, int(idle)))
-                    if cache.get(device_path) and (idle or (cache_timeout > (time.time() - cache[device_path][0]))):
-                        #print("Running %s from the cache" % device, file=sys.stderr)
-                        #sys.stderr.flush()
-                        logging.debug("Device %s is idle or metrics cache is not expired.  Using cache.", device_path)
-                        cache_age = (time.time() - cache[device_path][0])
-                        output("smartmon_cache_age_seconds{device=\"%s\",type=\"%s\"} %s\n" % (device, type_, cache_age))
-                        output("smartmon_data_from_cache{device=\"%s\",type=\"%s\"} %s\n" % (device, type_, 1))
+                    output(
+                        'smartmon_disk_standby{device="%s",type="%s"} %s\n'
+                        % (device, type_, int(idle))
+                    )
+                    if cache.get(device_path) and (
+                        idle or (cache_timeout > (time.time() - cache[device_path][0]))
+                    ):
+                        # print("Running %s from the cache" % device, file=sys.stderr)
+                        # sys.stderr.flush()
+                        logging.debug(
+                            "Device %s is idle or metrics cache is not expired.  Using cache.",
+                            device_path,
+                        )
+                        cache_age = time.time() - cache[device_path][0]
+                        output(
+                            'smartmon_cache_age_seconds{device="%s",type="%s"} %s\n'
+                            % (device, type_, cache_age)
+                        )
+                        output(
+                            'smartmon_data_from_cache{device="%s",type="%s"} %s\n'
+                            % (device, type_, 1)
+                        )
                         outputs.append(cache[device_path][1])
                     else:
+
                         def do_device(dev, typ):
-                            logging.debug("Device %s is active or metrics cache is expired.  Retrieving metrics.", dev)
-                            cmd = ['bash', '-c', smartmon_prog, dev, typ]
+                            logging.debug(
+                                "Device %s is active or metrics cache is expired.  Retrieving metrics.",
+                                dev,
+                            )
+                            cmd = ["bash", "-c", smartmon_prog, dev, typ]
                             o = subprocess.check_output(cmd)
                             cache[dev] = [time.time(), o]
-                            output("smartmon_cache_age_seconds{device=\"%s\",type=\"%s\"} %s\n" % (dev, typ, 0))
-                            output("smartmon_data_from_cache{device=\"%s\",type=\"%s\"} %s\n" % (dev, typ, 0))
+                            output(
+                                'smartmon_cache_age_seconds{device="%s",type="%s"} %s\n'
+                                % (dev, typ, 0)
+                            )
+                            output(
+                                'smartmon_data_from_cache{device="%s",type="%s"} %s\n'
+                                % (dev, typ, 0)
+                            )
                             output(cache[dev][1])
-                            logging.debug("Finished retrieving metrics from device %s.", dev)
-                        threads.append(threading.Thread(target=do_device, args=(device_path, type_)))
+                            logging.debug(
+                                "Finished retrieving metrics from device %s.", dev
+                            )
+
+                        threads.append(
+                            threading.Thread(
+                                target=do_device, args=(device_path, type_)
+                            )
+                        )
                         threads[-1].start()
                 for t in threads:
                     t.join()
             self.send_response(200)
-            self.send_header('Content-Type', 'text/plain; version=0.0.4; charset=utf-8')
+            self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
             self.end_headers()
             for o in outputs:
                 if hasattr(o, "encode"):
@@ -345,9 +394,13 @@ if len(sys.argv) == 1:
     print(get_device_list())
     for dev, typ in get_device_list():
         print(dev, is_standby(dev))
-        print(subprocess.check_output(['bash', '-xc', smartmon_prog, dev, typ]).decode('utf-8'))
+        print(
+            subprocess.check_output(["bash", "-xc", smartmon_prog, dev, typ]).decode(
+                "utf-8"
+            )
+        )
 else:
-    server = http.server.HTTPServer(('', int(sys.argv[1])), SimplePromHandler)
+    server = http.server.HTTPServer(("", int(sys.argv[1])), SimplePromHandler)
     cache_timeout = int(sys.argv[2])
     logging.info("Serving on TCP port %s", sys.argv[1])
     server.serve_forever()
