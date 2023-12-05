@@ -10,16 +10,16 @@ import subprocess
 import sys
 import threading
 import time
+from typing import Any, Dict, List, Set, Tuple, Union
 
-from typing import List, Dict, Tuple, Union
+KEY_VALUE_SPLITTER = re.compile(":\s+")
+METRIC_NAME_RE = re.compile("[a-zA-Z_:][a-zA-Z0-9_:]*")
+METRIC_LABEL_NAME_RE = re.compile("[a-zA-Z_][a-zA-Z0-9_]*")
 
-key_value_splitter = re.compile(":\s+")
-metric_name_re = re.compile("[a-zA-Z_:][a-zA-Z0-9_:]*")
-metric_label_name_re = re.compile("[a-zA-Z_][a-zA-Z0-9_]*")
-
-UNITLESS_TOTAL_POSTFIX = "_total"
-SECONDS_TOTAL_POSTFIX = "_seconds_total"
-BYTES_POSTFIX = "_bytes"
+UNITLESS_TOTAL_SUFFIX = "_total"
+SECONDS_TOTAL_SUFFIX = "_seconds_total"
+BYTES_SUFFIX = "_bytes"
+RATIO_SUFFIX = "_ratio"
 
 smartmon_prog = r"""#!/bin/bash
 # Script informed by the collectd monitoring script for smartmontools (using smartctl)
@@ -236,6 +236,47 @@ class Cache:
         self.timeout = timeout
 
 
+class LogEachMessageOnce(logging.Filter):
+    """Context manager to log each message only once per logger.
+
+    Track each message template on a per-logger basis (or, if unspecified,
+    the root logger by default) and, if a message is seen more than once
+    traversing that logger (or its children), then forego logging it.
+
+    Only active during the context in which this context manager is active.
+
+    Usage:
+
+        with LogEachMessageOnce(): # automatically apply to root logger
+            logging.warning("This message only logs once per device %s", device)
+            logging.warning("This message only logs once per device %s", device)
+    """
+
+    msgs: Dict[
+        logging.Logger, Set[str]
+    ] = {}  # Shared between instances from beginning to end of program.
+    lock = threading.Lock()
+
+    def __init__(self, logger: Union[logging.Logger, None] = None) -> None:
+        self.logger = logger or logging.getLogger()
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = str(record.msg)
+        with self.lock:
+            is_duplicate = self.logger in self.msgs and msg in self.msgs[self.logger]
+            if not is_duplicate:
+                if self.logger not in self.msgs:
+                    self.msgs[self.logger] = set()
+                self.msgs[self.logger].add(msg)
+        return not is_duplicate
+
+    def __enter__(self) -> None:
+        self.logger.addFilter(self)
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.logger.removeFilter(self)
+
+
 def is_standby(device: str) -> bool:
     try:
         out = subprocess.check_output(
@@ -274,12 +315,12 @@ def format_labelpair(label: str, value: str) -> str:
 def format_metric(
     metric: str, labelpairs: Dict[str, str], value: Union[float, int]
 ) -> Union[str, None]:
-    if not metric_name_re.match(metric):
+    if not METRIC_NAME_RE.match(metric):
         logging.warning("Cannot serialize metric %s: invalid metric name", metric)
         return None
 
     for p in labelpairs:
-        if not metric_label_name_re.match(p):
+        if not METRIC_LABEL_NAME_RE.match(p):
             logging.warning(
                 "Cannot serialize metric %s: invalid metric label %s", metric, p
             )
@@ -372,18 +413,18 @@ def render_nvme_metrics(
     )
     for line in info.splitlines():
         try:
-            key, value = key_value_splitter.split(line)
+            key, value = KEY_VALUE_SPLITTER.split(line)
         except ValueError:
             continue
         if key in device_info_table:
             device_info_labels[device_info_table[key]] = value
         elif key == "Total NVM Capacity":
             metrics.append(
-                ("nvm_capacity_total" + BYTES_POSTFIX, {}, convert_to_int(value))
+                ("nvm_capacity_total" + BYTES_SUFFIX, {}, convert_to_int(value))
             )
         elif key == "Unallocated NVM Capacity":
             metrics.append(
-                ("nvm_capacity_unallocated" + BYTES_POSTFIX, {}, convert_to_int(value))
+                ("nvm_capacity_unallocated" + BYTES_SUFFIX, {}, convert_to_int(value))
             )
         elif key == "Number of Namespaces":
             metrics.append(("nvm_namespace_count", {}, convert_to_int(value)))
@@ -392,7 +433,7 @@ def render_nvme_metrics(
             if "Size" in key:
                 metrics.append(
                     (
-                        "nvm_namespace_size" + BYTES_POSTFIX,
+                        "nvm_namespace_size" + BYTES_SUFFIX,
                         {"namespace": number},
                         convert_to_int(value),
                     )
@@ -400,11 +441,16 @@ def render_nvme_metrics(
             elif "Formatted LBA Size" in key:
                 metrics.append(
                     (
-                        "nvm_namespace_lba_size" + BYTES_POSTFIX,
+                        "nvm_namespace_lba_size" + BYTES_SUFFIX,
                         {"namespace": number},
                         convert_to_int(value),
                     )
                 )
+        else:
+            logging.warning(
+                f"Metric {key} from device %s not understood",
+                device_path,
+            )
     if device_info_labels:
         metrics.insert(0, ("device_info", device_info_labels, 1))
 
@@ -417,7 +463,7 @@ def render_nvme_metrics(
     )
     for line in smartdata.splitlines():
         try:
-            key, value = key_value_splitter.split(line)
+            key, value = KEY_VALUE_SPLITTER.split(line)
         except ValueError:
             continue
         if "SMART overall-health" in key:
@@ -446,13 +492,13 @@ def render_nvme_metrics(
         elif "Spare" in key and "%" in value:
             metrics.append(
                 (
-                    normalize_metric_name(key) + "_ratio",
+                    normalize_metric_name(key) + RATIO_SUFFIX,
                     {},
                     convert_percent_to_ratio(value),
                 )
             )
         elif key == "Percentage Used":
-            metrics.append(("used_ratio", {}, convert_percent_to_ratio(value)))
+            metrics.append(("used" + RATIO_SUFFIX, {}, convert_percent_to_ratio(value)))
         elif key.startswith("Data Units"):
             metrics.append(
                 (
@@ -464,7 +510,7 @@ def render_nvme_metrics(
         elif key.startswith("Host") and "Commands" in key:
             metrics.append(
                 (
-                    (normalize_metric_name(key) + UNITLESS_TOTAL_POSTFIX),
+                    (normalize_metric_name(key) + UNITLESS_TOTAL_SUFFIX),
                     {},
                     convert_to_int(value),
                 )
@@ -474,7 +520,7 @@ def render_nvme_metrics(
                 normalize_metric_name(
                     key.replace("Comp.", "Composite").replace(" Time", "")
                 )
-                + SECONDS_TOTAL_POSTFIX
+                + SECONDS_TOTAL_SUFFIX
             )
             metrics.append((key, {}, convert_to_int(value) * 60))
         elif key in (
@@ -484,7 +530,7 @@ def render_nvme_metrics(
         ):
             metrics.append(
                 (
-                    normalize_metric_name(key) + UNITLESS_TOTAL_POSTFIX,
+                    normalize_metric_name(key) + UNITLESS_TOTAL_SUFFIX,
                     {},
                     convert_to_int(value),
                 )
@@ -493,7 +539,7 @@ def render_nvme_metrics(
         elif key == "Power On Hours":
             metrics.append(
                 (
-                    "power_on" + SECONDS_TOTAL_POSTFIX,
+                    "power_on" + SECONDS_TOTAL_SUFFIX,
                     {},
                     convert_to_int(value) * 3600,
                 )
@@ -502,6 +548,11 @@ def render_nvme_metrics(
             sensor = key.split()[2]
             key = normalize_metric_name("temperature_sensor_" + value.split()[1])
             metrics.append((key, {"sensor": sensor}, convert_to_int(value)))
+        else:
+            logging.warning(
+                f"Metric {key} from device %s not understood",
+                device_path,
+            )
 
     deduped_metrics: Dict[str, Tuple[str, Dict[str, str], Union[float, int]]] = {}
 
@@ -610,7 +661,8 @@ def render_output(cache: Cache) -> bytes:
             kache.items[device_path] = entry
             with entry.lock:
                 kache.lock.release()
-                o = render_smart_data(device_path, name, type_)
+                with LogEachMessageOnce():
+                    o = render_smart_data(device_path, name, type_)
                 entry.output = o
 
             buffer(
