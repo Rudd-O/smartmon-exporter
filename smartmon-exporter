@@ -1,19 +1,25 @@
 #!/usr/bin/python3
 
-import collections
-import http.server
+import concurrent.futures
 import glob
-import io
+import http.server
 import logging
 import os
-import shutil
-import socket
-import socketserver
+import re
 import subprocess
 import sys
-import time
 import threading
+import time
 
+from typing import List, Dict, Tuple, Union
+
+key_value_splitter = re.compile(":\s+")
+metric_name_re = re.compile("[a-zA-Z_:][a-zA-Z0-9_:]*")
+metric_label_name_re = re.compile("[a-zA-Z_][a-zA-Z0-9_]*")
+
+UNITLESS_TOTAL_POSTFIX = "_total"
+SECONDS_TOTAL_POSTFIX = "_seconds_total"
+BYTES_POSTFIX = "_bytes"
 
 smartmon_prog = r"""#!/bin/bash
 # Script informed by the collectd monitoring script for smartmontools (using smartctl)
@@ -199,9 +205,10 @@ do_drive() {
   sat) /usr/sbin/smartctl -A -d "${type}" "${disk}" | parse_smartctl_attributes "${diskb}" "${type}" | format_output ;;
   sat+megaraid*) /usr/sbin/smartctl -A -d "${type}" "${disk}" | parse_smartctl_attributes "${diskb}" "${type}" | format_output ;;
   scsi) /usr/sbin/smartctl -A -d "${type}" "${disk}" | parse_smartctl_scsi_attributes "${diskb}" "${type}" | format_output ;;
+  nvme) /usr/sbin/smartctl -A -d "${type}" "${disk}" | parse_smartctl_attributes "${diskb}" "${type}" | format_output ;;
   megaraid*) /usr/sbin/smartctl -A -d "${type}" "${disk}" | parse_smartctl_scsi_attributes "${diskb}" "${type}" | format_output ;;
   *)
-    echo "# disk type is not sat, scsi or megaraid but ${type}"
+    echo "# disk type is not sat, scsi or megaraid but ${type}" \>\&2
     return
     ;;
   esac
@@ -215,15 +222,21 @@ do_drive ${disk} ${type}
 """
 
 
-logging.basicConfig(level=logging.INFO)
+class CacheEntry:
+    def __init__(self) -> None:
+        self.output = b""
+        self.lock = threading.Lock()
+        self.time = time.time()
 
 
-cache = None
-cache_timeout = 0
-cache_lock = threading.Lock()
+class Cache:
+    def __init__(self, timeout: int) -> None:
+        self.lock = threading.Lock()
+        self.items: Dict[str, CacheEntry] = {}
+        self.timeout = timeout
 
 
-def is_standby(device):
+def is_standby(device: str) -> bool:
     try:
         out = subprocess.check_output(
             ["/usr/sbin/hdparm", "-C", device],
@@ -244,42 +257,394 @@ def is_standby(device):
     return idle
 
 
-old_devlist = None
-old_device_list = None
+def normalize_metric_name(m: str) -> str:
+    # FIXME remove all characters that cannot be used in label names
+    # in Prometheus according to the spec, then remove consecutive __s .
+    x = m.lower().replace(" ", "_").replace("/", "_")
+    while "__" in x:
+        x = x.replace("__", "_")
+    return x
 
 
-def get_device_list():
-    global old_devlist, old_device_list
+def format_labelpair(label: str, value: str) -> str:
+    escaped_value = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'{label}="{escaped_value}"'
 
-    devlist = glob.glob("/dev/sd?")
+
+def format_metric(
+    metric: str, labelpairs: Dict[str, str], value: Union[float, int]
+) -> Union[str, None]:
+    if not metric_name_re.match(metric):
+        logging.warning("Cannot serialize metric %s: invalid metric name", metric)
+        return None
+
+    for p in labelpairs:
+        if not metric_label_name_re.match(p):
+            logging.warning(
+                "Cannot serialize metric %s: invalid metric label %s", metric, p
+            )
+            return None
+
+    formatted_labelpairs = (
+        ("{" + ", ".join(format_labelpair(k, v) for k, v in labelpairs.items()) + "} ")
+        if labelpairs
+        else ""
+    )
+
+    return f"{metric}{formatted_labelpairs} {value}"
+
+
+def convert_percent_to_ratio(m: str) -> float:
+    assert m.endswith("%")
+    return float(m[:-1])
+
+
+def convert_to_int(m: str, base: Union[int, None] = None) -> int:
+    return int(m.split()[0].replace(",", ""), base=base or 10)
+
+
+def render_nvme_metrics(
+    device_path: str, type_: str
+) -> List[Tuple[str, Dict[str, str], Union[float, int]]]:
+    """
+    Documented at
+    https://media.kingston.com/support/downloads/MKP_521.6_SMART-DCP1000_attribute.pdf
+
+    Sample output:
+
+    === START OF INFORMATION SECTION ===
+    Model Number:                       Vi3000 Internal PCIe NVMe M.2 SSD 256GB
+    Serial Number:                      493733094833604
+    Firmware Version:                   H220902a
+    PCI Vendor/Subsystem ID:            0x1e4b
+    IEEE OUI Identifier:                0x000000
+    Total NVM Capacity:                 256,060,514,304 [256 GB]
+    Unallocated NVM Capacity:           0
+    Controller ID:                      0
+    NVMe Version:                       1.4
+    Number of Namespaces:               1
+    Namespace 1 Size/Capacity:          256,060,514,304 [256 GB]
+    Namespace 1 Formatted LBA Size:     512
+    Namespace 1 IEEE EUI-64:            000000 3094833604
+    Local Time is:                      Tue Dec  5 01:57:48 2023 UTC
+
+    === START OF SMART DATA SECTION ===
+    SMART overall-health self-assessment test result: PASSED
+
+    SMART/Health Information (NVMe Log 0x02)
+    Critical Warning:                   0x00
+    Temperature:                        45 Celsius
+    Available Spare:                    100%
+    Available Spare Threshold:          1%
+    Percentage Used:                    0%
+    Data Units Read:                    312,243 [159 GB]
+    Data Units Written:                 638,685 [327 GB]
+    Host Read Commands:                 2,489,053
+    Host Write Commands:                4,688,856
+    Controller Busy Time:               19
+    Power Cycles:                       41
+    Power On Hours:                     103
+    Unsafe Shutdowns:                   30
+    Media and Data Integrity Errors:    0
+    Error Information Log Entries:      0
+    Warning  Comp. Temperature Time:    0
+    Critical Comp. Temperature Time:    0
+    Temperature Sensor 1:               45 Celsius
+    Temperature Sensor 2:               39 Celsius
+    """
+    output = subprocess.check_output(
+        ["/usr/sbin/smartctl", "-i", "-H", "-a", "-d", type_, device_path],
+        universal_newlines=True,
+    )
+    metrics: List[Tuple[str, Dict[str, str], Union[float, int]]] = []
+
+    info = output.split("=== START OF INFORMATION SECTION ===\n")[1].split("\n\n===")[0]
+
+    device_info_table, device_info_labels = (
+        {
+            "Model Number": "device_model",
+            "Serial Number": "serial_number",
+            "Firmware Version": "firmware_version",
+            "PCI Vendor/Subsystem ID": "pci_vendor_subsystem_id",
+            "NVMe Version": "nvme_version",
+        },
+        {},
+    )
+    for line in info.splitlines():
+        try:
+            key, value = key_value_splitter.split(line)
+        except ValueError:
+            continue
+        if key in device_info_table:
+            device_info_labels[device_info_table[key]] = value
+        elif key == "Total NVM Capacity":
+            metrics.append(
+                ("nvm_capacity_total" + BYTES_POSTFIX, {}, convert_to_int(value))
+            )
+        elif key == "Unallocated NVM Capacity":
+            metrics.append(
+                ("nvm_capacity_unallocated" + BYTES_POSTFIX, {}, convert_to_int(value))
+            )
+        elif key == "Number of Namespaces":
+            metrics.append(("nvm_namespace_count", {}, convert_to_int(value)))
+        elif key.startswith("Namespace"):
+            number = key.split()[1]
+            if "Size" in key:
+                metrics.append(
+                    (
+                        "nvm_namespace_size" + BYTES_POSTFIX,
+                        {"namespace": number},
+                        convert_to_int(value),
+                    )
+                )
+            elif "Formatted LBA Size" in key:
+                metrics.append(
+                    (
+                        "nvm_namespace_lba_size" + BYTES_POSTFIX,
+                        {"namespace": number},
+                        convert_to_int(value),
+                    )
+                )
+    if device_info_labels:
+        metrics.insert(0, ("device_info", device_info_labels, 1))
+
+    metrics.append(("enabled", {}, 0))
+    metrics.append(("available", {}, 0))
+    smartdata = (
+        output.split("=== START OF SMART DATA SECTION ===")[1]
+        if "START OF SMART DATA SECTION" in output
+        else ""
+    )
+    for line in smartdata.splitlines():
+        try:
+            key, value = key_value_splitter.split(line)
+        except ValueError:
+            continue
+        if "SMART overall-health" in key:
+            metrics.append(("healthy", {}, (1 if value == "PASSED" else 0)))
+            metrics.append(("enabled", {}, 1))
+            metrics.append(("available", {}, 1))
+        elif key == "Critical Warning":
+            value = convert_to_int(value, 16)
+            for bit, label in [
+                (1, "spare space low"),
+                (2, "temperature outside operating range"),
+                (3, "read only mode"),
+                (4, "volatile memory backup failed"),
+            ]:
+                metrics.append(
+                    ("critical_warning", {"category": label}, 1 if value & bit else 0)
+                )
+        elif key == "Temperature":
+            metrics.append(
+                (
+                    normalize_metric_name(key + "_" + value.split()[1]),
+                    {},
+                    convert_to_int(value),
+                )
+            )
+        elif "Spare" in key and "%" in value:
+            metrics.append(
+                (
+                    normalize_metric_name(key) + "_ratio",
+                    {},
+                    convert_percent_to_ratio(value),
+                )
+            )
+        elif key == "Percentage Used":
+            metrics.append(("used_ratio", {}, convert_percent_to_ratio(value)))
+        elif key.startswith("Data Units"):
+            metrics.append(
+                (
+                    normalize_metric_name(key.split()[2] + " units"),
+                    {},
+                    convert_to_int(value),
+                )
+            )
+        elif key.startswith("Host") and "Commands" in key:
+            metrics.append(
+                (
+                    (normalize_metric_name(key) + UNITLESS_TOTAL_POSTFIX),
+                    {},
+                    convert_to_int(value),
+                )
+            )
+        elif key == "Controller Busy Time" or "Temperature Time" in key:
+            key = (
+                normalize_metric_name(
+                    key.replace("Comp.", "Composite").replace(" Time", "")
+                )
+                + SECONDS_TOTAL_POSTFIX
+            )
+            metrics.append((key, {}, convert_to_int(value) * 60))
+        elif key in (
+            "Power Cycles",
+            "Unsafe Shutdowns",
+            "Media and Data Integrity Errors",
+        ):
+            metrics.append(
+                (
+                    normalize_metric_name(key) + UNITLESS_TOTAL_POSTFIX,
+                    {},
+                    convert_to_int(value),
+                )
+            )
+
+        elif key == "Power On Hours":
+            metrics.append(
+                (
+                    "power_on" + SECONDS_TOTAL_POSTFIX,
+                    {},
+                    convert_to_int(value) * 3600,
+                )
+            )
+        elif key.startswith("Temperature Sensor"):
+            sensor = key.split()[2]
+            key = normalize_metric_name("temperature_sensor_" + value.split()[1])
+            metrics.append((key, {"sensor": sensor}, convert_to_int(value)))
+
+    deduped_metrics: Dict[str, Tuple[str, Dict[str, str], Union[float, int]]] = {}
+
+    for mname, labels, value in metrics:
+        deduped_metrics[f"{mname}-{labels}"] = (mname, labels, value)
+
+    return list(deduped_metrics.values())
+
+
+def render_smart_data(device_path: str, name: str, type_: str) -> bytes:
+    if type_ == "nvme":
+        metrics = render_nvme_metrics(device_path, type_)
+        rendered: List[str] = []
+        for key, labels, value in metrics:
+            labels["device"] = name
+            labels["type"] = type_
+            m = format_metric("smartmon_" + key, labels, value)
+            if m is not None:
+                rendered.append(m)
+        return "\n".join(rendered).encode("utf-8")
+    else:
+        return subprocess.check_output(
+            ["bash", "-c", smartmon_prog, device_path, type_]
+        )
+
+
+old_devlist: Union[List[str], None] = None
+old_device_type_list: List[List[str]] = []
+
+
+def get_device_list() -> List[List[str]]:
+    global old_devlist, old_device_type_list
+
+    devlist: List[str] = []
+    for fn in sorted(glob.glob("/sys/block/*/dev")):
+        with open(fn, "r") as f:
+            devlist.append(f.read().strip())
+
+    logging.debug("Obtained device major/minor list: %s", devlist)
+
     if old_devlist == devlist:
         # Prevent scan since nothing has changed.
         logging.debug("Eliding disk scan.")
-        return old_device_list
-    logging.debug("Scanning device list %s", devlist)
+        return old_device_type_list
 
-    logging.debug("Asking smartctl to scan devices.")
-    device_list = [
-        x.strip().split("|")
+    logging.debug("Devices have changed.  Asking smartctl to scan devices again.")
+    device_type_list = [
+        [x.strip().split()[0], x.strip().split()[2]]
         for x in subprocess.check_output(
-            [
-                "bash",
-                "-c",
-                """ /usr/sbin/smartctl --scan-open -n standby | awk '/^\/dev/{print $1 "|" $3}' """,
-            ]
-        )
-        .decode("utf-8")
-        .splitlines()
+            ["/usr/sbin/smartctl", "--scan-open"], universal_newlines=True
+        ).splitlines()
         if x.strip()
     ]
     old_devlist = devlist
-    old_device_list = device_list
-    logging.debug("New device list: %s", device_list)
-    return device_list
+    old_device_type_list = device_type_list
+    logging.debug("New device list: %s", device_type_list)
+    return device_type_list
+
+
+def render_output(cache: Cache) -> bytes:
+    def produce_output_for_a_drive(
+        kache: Cache,
+        device_path: str,
+        type_: str,
+    ) -> List[bytes]:
+        buf: List[bytes] = []
+
+        def buffer(o: Union[str, bytes]) -> None:
+            buf.append(o if isinstance(o, bytes) else o.encode("utf-8"))
+
+        name = os.path.basename(device_path)
+        idle = is_standby(device_path)
+        buffer(
+            'smartmon_disk_standby{device="%s",type="%s"} %s' % (name, type_, int(idle))
+        )
+
+        kache.lock.acquire()
+        if kache.items.get(device_path) and (
+            idle or (kache.timeout > (time.time() - kache.items[device_path].time))
+        ):
+            logging.debug(
+                "Device %s is idle or metrics cache is not expired.  Using cache.",
+                device_path,
+            )
+            entry = kache.items[device_path]
+            with entry.lock:
+                kache.lock.release()
+                cache_age = time.time() - entry.time
+                o = entry.output
+
+            buffer(
+                'smartmon_cache_age_seconds{device="%s",type="%s"} %s'
+                % (name, type_, cache_age)
+            )
+            buffer(
+                'smartmon_data_from_cache{device="%s",type="%s"} %s' % (name, type_, 1)
+            )
+
+        else:
+            logging.debug(
+                "Device %s is active or metrics cache is expired.  Retrieving metrics.",
+                name,
+            )
+
+            entry = CacheEntry()
+            kache.items[device_path] = entry
+            with entry.lock:
+                kache.lock.release()
+                o = render_smart_data(device_path, name, type_)
+                entry.output = o
+
+            buffer(
+                'smartmon_cache_age_seconds{device="%s",type="%s"} %s'
+                % (name, type_, 0)
+            )
+            buffer(
+                'smartmon_data_from_cache{device="%s",type="%s"} %s' % (name, type_, 0)
+            )
+            logging.debug("Finished retrieving metrics from device %s.", name)
+
+        buffer(o.strip())
+        return buf
+
+    device_list = get_device_list()
+    per_device_output: List[bytes] = [
+        ("smartmon_total_device_count %s" % len(device_list)).encode("utf-8")
+    ]
+
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        future_to_url = {
+            executor.submit(produce_output_for_a_drive, cache, *devtyp): devtyp
+            for devtyp in device_list
+        }
+
+        for future in concurrent.futures.as_completed(future_to_url):
+            buffered = future.result()
+            per_device_output.extend(buffered)
+
+    return b"\n".join(per_device_output)
 
 
 class SimplePromHandler(http.server.BaseHTTPRequestHandler):
-    def handle_non_metrics(self):
+    def handle_non_metrics(self) -> bool:
         if self.path == "/":
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -296,112 +661,44 @@ class SimplePromHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
             return True
+        return False
 
-    def log_request(code="-", size="-"):
+    def log_request(
+        self, code: Union[int, str] = "-", size: Union[int, str] = "-"
+    ) -> None:
         pass
 
-    def do_GET(self):
+    def do_GET(self) -> None:
         if self.handle_non_metrics():
             return
 
+        global cache
+
         try:
-            global cache_lock, cache, cache_timeout
-            with cache_lock:
-                if cache is None:
-                    logging.debug("Initializing cache.")
-                    cache = {}
-                threads = []
-                outputs_lock = threading.Lock()
-                outputs = []
-
-                def output(o):
-                    with outputs_lock:
-                        outputs.append(o)
-
-                device_list = get_device_list()
-                output("smartmon_total_device_count %s\n" % len(device_list))
-                for device, type_ in device_list:
-                    device_path, device = device, os.path.basename(device)
-                    idle = is_standby(device_path)
-                    output(
-                        'smartmon_disk_standby{device="%s",type="%s"} %s\n'
-                        % (device, type_, int(idle))
-                    )
-                    if cache.get(device_path) and (
-                        idle or (cache_timeout > (time.time() - cache[device_path][0]))
-                    ):
-                        # print("Running %s from the cache" % device, file=sys.stderr)
-                        # sys.stderr.flush()
-                        logging.debug(
-                            "Device %s is idle or metrics cache is not expired.  Using cache.",
-                            device_path,
-                        )
-                        cache_age = time.time() - cache[device_path][0]
-                        output(
-                            'smartmon_cache_age_seconds{device="%s",type="%s"} %s\n'
-                            % (device, type_, cache_age)
-                        )
-                        output(
-                            'smartmon_data_from_cache{device="%s",type="%s"} %s\n'
-                            % (device, type_, 1)
-                        )
-                        outputs.append(cache[device_path][1])
-                    else:
-
-                        def do_device(dev, typ):
-                            logging.debug(
-                                "Device %s is active or metrics cache is expired.  Retrieving metrics.",
-                                dev,
-                            )
-                            cmd = ["bash", "-c", smartmon_prog, dev, typ]
-                            o = subprocess.check_output(cmd)
-                            cache[dev] = [time.time(), o]
-                            output(
-                                'smartmon_cache_age_seconds{device="%s",type="%s"} %s\n'
-                                % (dev, typ, 0)
-                            )
-                            output(
-                                'smartmon_data_from_cache{device="%s",type="%s"} %s\n'
-                                % (dev, typ, 0)
-                            )
-                            output(cache[dev][1])
-                            logging.debug(
-                                "Finished retrieving metrics from device %s.", dev
-                            )
-
-                        threads.append(
-                            threading.Thread(
-                                target=do_device, args=(device_path, type_)
-                            )
-                        )
-                        threads[-1].start()
-                for t in threads:
-                    t.join()
+            output = render_output(cache)
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
             self.end_headers()
-            for o in outputs:
-                if hasattr(o, "encode"):
-                    o = o.encode("utf-8")
-                try:
-                    self.wfile.write(o)
-                except TypeError:
-                    assert 0, o
+            self.wfile.write(output)
+
         except subprocess.CalledProcessError:
             self.send_response(500)
 
 
+logging.basicConfig(level=logging.DEBUG if os.getenv("DEBUG") else logging.INFO)
+
 if len(sys.argv) == 1:
-    print(get_device_list())
-    for dev, typ in get_device_list():
-        print(dev, is_standby(dev))
-        print(
-            subprocess.check_output(["bash", "-xc", smartmon_prog, dev, typ]).decode(
-                "utf-8"
-            )
-        )
+    print(render_output(Cache(0)).decode("utf-8"))
+    # print(get_device_list())
+    # for dev, typ in get_device_list():
+    #    print(dev, is_standby(dev))
+    #    print(
+    #        subprocess.check_output(["bash", "-xc", smartmon_prog, dev, typ]).decode(
+    #            "utf-8"
+    #        )
+    #    )
 else:
+    cache = Cache(int(sys.argv[2]))
     server = http.server.HTTPServer(("", int(sys.argv[1])), SimplePromHandler)
-    cache_timeout = int(sys.argv[2])
     logging.info("Serving on TCP port %s", sys.argv[1])
     server.serve_forever()
