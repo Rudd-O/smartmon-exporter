@@ -608,7 +608,9 @@ def get_device_list() -> List[List[str]]:
     ]
     old_devlist = devlist
     old_device_type_list = device_type_list
-    logging.debug("New device list: %s", device_type_list)
+    logging.info("Devices discovered:")
+    for d, t in device_type_list:
+        logging.info("* %s (type %s)", d, t)
     return device_type_list
 
 
