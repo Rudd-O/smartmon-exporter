@@ -162,7 +162,7 @@ parse_smartctl_info() {
   echo "device_smart_available{device=\"${diskb}\",type=\"${disk_type}\"} ${smart_available}"
   echo "device_smart_enabled{device=\"${diskb}\",type=\"${disk_type}\"} ${smart_enabled}"
   if [ "${temp_1}" != "" ] ; then
-    echo "smartmon_temperature_celsius_value{device=\"${diskb}\"} ${temp_1}"
+    echo "smartmon_temperature_celsius_value{device=\"${diskb}\",type=\"${disk_type}\"} ${temp_1}"
   fi
 }
 
